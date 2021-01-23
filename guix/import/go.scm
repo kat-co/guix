@@ -21,8 +21,10 @@
   #:use-module (ice-9 rdelim)
   #:use-module (ice-9 receive)
   #:use-module (ice-9 regex)
+  #:use-module (rnrs base)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-34)
   #:use-module (guix json)
   #:use-module ((guix download) #:prefix download:)
   #:use-module (guix import utils)
@@ -38,7 +40,7 @@
 
   #:export (go-module->guix-package
             go-module-recursive-import
-            infer-module-root))
+            fetch-module-meta-data))
 
 (define (escape-capital-letters s)
   "To avoid ambiguity when serving from case-insensitive file systems, the
@@ -76,10 +78,26 @@ and VERSION."
 
 (define (parse-go.mod go.mod-path)
   "Parses a go.mod file and returns an alist of module path to version."
+  (define (relative? e) (string= e ".."))
+  (define (resolve-replacement-path module-uri replacement-uri)
+    ;; Replacements may be paths relative to the module's URI. Here we
+    ;; resolve the relativity if necessary.
+    (let* ((module-path (split-and-decode-uri-path module-uri))
+           (replacement-path (split-and-decode-uri-path replacement-uri))
+           (number-relative-dir-up (length (filter relative? replacement-path))))
+      (if (> number-relative-dir-up 0)
+          (encode-and-join-uri-path (append
+                                     (take module-path (- (length module-path)
+                                                          number-relative-dir-up))
+                                     (remove relative? replacement-path)))
+          replacement-uri)))
   (with-input-from-file go.mod-path
     (lambda ()
       (let ((in-require? #f)
-            (requirements (list)))
+            (in-replace? #f)
+            (requirements (list))
+            ;; (original-mod-path . (new-mod-path . version))
+            (replacements (list)))
         (do ((line (read-line) (read-line)))
             ((eof-object? line))
           (set! line (string-trim line))
@@ -89,21 +107,40 @@ and VERSION."
           (cond
            ((string=? line "require (")
             (set! in-require? #t))
+           ((string=? line "replace (")
+            (set! in-replace? #t))
+           ;; Closing out either a require or replace block (exclude blocks
+           ;; are not handled by this parser).
            ((and in-require? (string=? line ")"))
-            (set! in-require? #f))
-           (in-require?
-            (let* ((requirement (string-split line #\space))
+            (when in-require? (set! in-require? #f))
+            (when in-replace? (set! in-replace? #f)))
+           ((or in-require? (string-prefix? "require" line))
+            (let* ((require-offset (if in-require? 1 0))
+                   (requirement (string-split line #\space))
                    ;; Modules should be unquoted
-                   (module-path (string-delete #\" (car requirement)))
-                   (version (list-ref requirement 1)))
+                   (module-path (string-delete #\" (list-ref requirement (- 1 require-offset))))
+                   (version (list-ref requirement (- 2 require-offset))))
               (set! requirements (acons module-path version requirements))))
-           ((string-prefix? "replace" line)
-            (let* ((requirement (string-split line #\space))
-                   (module-path (list-ref requirement 1))
-                   (new-module-path (list-ref requirement 3))
-                   (version (list-ref requirement 4)))
-              (set! requirements (assoc-remove! requirements module-path))
-              (set! requirements (acons new-module-path version requirements))))))
+           ((or in-replace? (string-prefix? "replace" line))
+            (let* ((replace-offset (if in-replace? 1 0))
+                   (requirement (string-split line #\space))
+                   (module-path (list-ref requirement (- 1 replace-offset)))
+                   (new-module-path (resolve-replacement-path module-path
+                                                              (list-ref requirement (- 3 replace-offset))))
+                   (version? (> (length requirement) (- 4 replace-offset)))
+                   (version (if version? (list-ref requirement 4) #f)))
+              (set! replacements (acons module-path (cons new-module-path
+                                                          version)
+                                        replacements))))))
+        ;; Make any replacements necessary
+        (map
+         (lambda (r)
+           (let ((old-path (car r))
+                 (new-path (cadr r))
+                 (version (cddr r)))
+             (set! requirements (assoc-remove! requirements old-path))
+             (set! requirements (acons new-path version requirements))))
+         replacements)
         requirements))))
 
 (define (module-path-without-major-version module-path)
@@ -169,36 +206,69 @@ consists of a module's root page is known before hand."
                     "." "-")
                    "/" "-"))))
 
-(define (fetch-module-meta-data module-path)
+(define* (fetch-module-meta-data module-path #:key (module-uri #f))
   "Fetches module meta-data from a module's landing page. This is necessary
 because goproxy servers don't currently provide all the information needed to
-build a package."
-  (let* ((port (http-fetch (string->uri (format #f "https://~a?go-get=1" module-path))))
-         (module-metadata #f)
-         (meta-tag-prefix "<meta name=\"go-import\" content=\"")
-         (meta-tag-prefix-length (string-length meta-tag-prefix)))
-    (do ((line (read-line port) (read-line port)))
-        ((or (eof-object? line)
-             module-metadata))
-      (let ((meta-tag-index (string-contains line meta-tag-prefix)))
-        (when meta-tag-index
-          (let* ((start (+ meta-tag-index meta-tag-prefix-length))
-                 (end (string-index line #\" start)))
-            (set! module-metadata
-              (string-split (substring/shared line start end) #\space))))))
-    (close-port port)
-    module-metadata))
+build a package.
+
+There are valid Go Module paths which when queried will not serve the
+requisite meta tag. This function will recursively walk up the URI
+path (e.g. https://foo.bar/baz/bamf?go-get=1 -> https://foo.bar/baz?go-get=1,
+etc.) in an attempt to fetch a valid meta tag."
+  (unless module-uri
+    (set! module-uri (string->uri (format #f "https://~a?go-get=1" module-path))))
+  (guard (c (#t
+             ;;(format #t "Caugh exception ~a~%" c)
+             (let* ((d (uri->string module-uri))
+                    (path (uri-path module-uri))
+                    (path-list (split-and-decode-uri-path path))
+                    (broader-path (if (null? path-list)
+                                      (list)
+                                      (take path-list (- (length path-list) 1)))))
+               (if (< (length broader-path) (length path-list))
+                   (fetch-module-meta-data
+                    module-path
+                    #:module-uri
+                    (build-uri (uri-scheme module-uri)
+                               #:host (uri-host module-uri)
+                               #:port (uri-port module-uri)
+                               #:path (format #f "/~a"
+                                              (encode-and-join-uri-path
+                                               broader-path))
+                               #:query (uri-query module-uri)))
+                   (raise-exception c)))))
+    ;; TODO: Meta tags reflect the URL, and so redirects give meta tags we don't know how to look for
+    (let* ((port (http-fetch module-uri))
+           (module-metadata #f)
+           (meta-tag-prefix (format #f "<meta name=\"go-import\" content=\"~a "
+                                    module-path))
+           (meta-tag-prefix-length (string-length meta-tag-prefix)))
+      (do ((line (read-line port) (read-line port)))
+          ((or (eof-object? line)
+               module-metadata))
+        (let ((meta-tag-index (string-contains line meta-tag-prefix)))
+          (when meta-tag-index
+            (let* ((start (+ meta-tag-index meta-tag-prefix-length))
+                   (end (string-index line #\" start))
+                   (meta-data (string-split (substring/shared line start end) #\space)))
+              (set! module-metadata meta-data)))))
+      (close-port port)
+      (unless module-metadata
+        (raise-exception
+         (format #f "meta-data not found for module \"~a\" at \"~a\""
+                 module-path (uri->string module-uri))))
+      module-metadata)))
 
 (define (module-meta-data-scs meta-data)
   "Return the source control system specified by a module's meta-data."
-  (string->symbol (list-ref meta-data 1)))
+  (string->symbol (list-ref meta-data 0)))
 
 (define (module-meta-data-repo-url meta-data goproxy-url)
   "Return the URL where the fetcher which will be used can download the source
 control."
   (if (member (module-meta-data-scs meta-data) '(fossil mod))
       goproxy-url
-      (list-ref meta-data 2)))
+      (list-ref meta-data 1)))
 
 (define (source-uri scs-type scs-repo-url file)
   "Generate the `origin' block of a package depending on what type of source
@@ -247,6 +317,7 @@ control system is being used."
             ;; SCS type and URL are not included in goproxy information. For
             ;; this we need to fetch it from the official module page.
             (meta-data (fetch-module-meta-data root-module-path))
+            (foo (unless meta-data (raise-exception (format #f "bad meta-data for `~a`" module-path))))
             (scs-type (module-meta-data-scs meta-data))
             (scs-repo-url (module-meta-data-repo-url meta-data goproxy-url)))
        (values
